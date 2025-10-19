@@ -95,10 +95,32 @@ export async function createJiraPlanAction(payload) {
     // Create all the Jira issues automatically
     const createdIssues = await createJiraIssues(projectKey, plan, goal, {});
 
+    // Check if any issues were created
+    if (createdIssues.epics.length === 0 && createdIssues.stories.length === 0 && createdIssues.subtasks.length === 0) {
+      return {
+        success: false,
+        message: 'No issues were created. This might be because all items already exist in your chat history. If you want to start fresh, you can reset the chat history.'
+      };
+    }
+
+    // Build detailed summary with bullet points for Rovo chat
+    let detailedSummary = `## Successfully Created Jira Plan for ${projectKey}\n\n`;
+    detailedSummary += `**Summary:**\n`;
+    detailedSummary += `- ${createdIssues.epics.length} Epics\n`;
+    detailedSummary += `- ${createdIssues.stories.length} Stories\n`;
+    detailedSummary += `- ${createdIssues.subtasks.length} Subtasks\n\n`;
+
+    if (createdIssues.epics.length > 0) {
+      detailedSummary += `**Epics Created:**\n`;
+      createdIssues.epics.forEach(epic => {
+        detailedSummary += `- ${epic.key}: ${epic.summary}\n`;
+      });
+    }
+
     // Return summary for the Rovo agent to share with the user
     return {
       success: true,
-      message: `Successfully created ${createdIssues.epics.length} epics, ${createdIssues.stories.length} stories, and ${createdIssues.subtasks.length} subtasks in project ${projectKey}!`,
+      message: detailedSummary,
       summary: {
         projectKey: projectKey,
         epicCount: createdIssues.epics.length,
@@ -196,6 +218,10 @@ function parseGoalIntoPlan(goal, context = {}) {
 
 /**
  * Analyzes a goal to understand its scope, complexity, and required work areas
+ * Complexity mapping based on manifest.yml prompt:
+ * - SIMPLE: 1-2 epics (e.g., "Add a login button")
+ * - MEDIUM: 2-4 epics (e.g., "Build a user authentication system")
+ * - COMPLEX: 4-8 epics (e.g., "Build a mobile app", "Create an e-commerce platform")
  */
 function analyzeGoal(goal) {
   const words = goal.split(/\s+/).length;
@@ -235,9 +261,59 @@ function analyzeGoal(goal) {
     workAreas.push({ type: 'implementation', keywords: [] });
   }
 
+  // Determine complexity based on multiple factors
+  // Align with manifest.yml definitions:
+  // - SIMPLE: 1 epic
+  // - MEDIUM: 2 epics
+  // - COMPLEX: 6 epics
+  let complexity = 'low';
+
+  // Factor 1: Number of work areas detected (primary indicator)
+  if (workAreas.length >= 4) {
+    complexity = 'high'; // Will generate 6 epics
+    // For high complexity, limit to 6 work areas
+    if (workAreas.length > 6) {
+      workAreas.splice(6);
+    }
+  } else if (workAreas.length >= 2) {
+    complexity = 'medium'; // Will generate 2 epics
+    // For medium complexity, limit to 2 work areas
+    if (workAreas.length > 2) {
+      workAreas.splice(2);
+    }
+  } else {
+    complexity = 'low'; // Will generate 1 epic
+    // For low complexity, limit to 1 work area
+    if (workAreas.length > 1) {
+      workAreas.splice(1);
+    }
+  }
+
+  // Factor 2: Word count indicates detail level
+  if (words > 100) {
+    complexity = 'high';
+  } else if (words > 30 && complexity === 'low') {
+    complexity = 'medium';
+  }
+
+  // Factor 3: Certain work areas inherently indicate higher complexity
+  const highComplexityAreas = ['mobile', 'backend', 'auth', 'deployment', 'data'];
+  const hasHighComplexityArea = workAreas.some(area => highComplexityAreas.includes(area.type));
+  if (hasHighComplexityArea && complexity === 'low') {
+    complexity = 'medium';
+  }
+
+  // Factor 4: Multiple sentences suggest more detailed requirements
+  if (sentences >= 3 && complexity === 'low') {
+    complexity = 'medium';
+  }
+  if (sentences >= 5) {
+    complexity = 'high';
+  }
+
   return {
     workAreas,
-    complexity: words > 100 ? 'high' : words > 30 ? 'medium' : 'low',
+    complexity,
     wordCount: words,
     sentenceCount: sentences
   };
@@ -273,8 +349,8 @@ function generateEpicForWorkArea(workArea, goal, analysis, context) {
     name: epicName,
     summary: epicSummary,
     description: epicDescription,
-    difficulty: epicDifficulty, // Difficulty: Easy|Medium|Hard
-    estimatedTime: epicEstimatedTime, // Estimated time: e.g., "2-4 weeks"
+    difficulty: epicDifficulty,
+    estimatedTime: epicEstimatedTime,
     labels: [type, ...(context.labels || [])],
     stories: stories
   };
@@ -282,15 +358,44 @@ function generateEpicForWorkArea(workArea, goal, analysis, context) {
 
 /**
  * Generate stories for a work area based on goal and analysis
+ * Dynamic with complexity-based ranges
  */
 function generateStoriesForWorkArea(type, goal, keywords, analysis) {
   const stories = [];
 
-  // Determine number of stories based on complexity
-  const storyCount = analysis.complexity === 'high' ? 4 : analysis.complexity === 'medium' ? 3 : 2;
+  // Get available story phases for this work area
+  const availablePhases = getStoryPhases(type);
 
-  // Generate contextual stories based on work area type
-  const storyPhases = getStoryPhases(type, storyCount);
+  // Dynamically determine how many stories based on goal analysis
+  // Use word count as a proxy for detail/scope - more words = more detailed requirements = more stories
+  let storyCount;
+
+  // Base calculation: more words = more stories needed
+  const baseStoryCount = Math.ceil(analysis.wordCount / 8); // Roughly 1 story per 8 words
+
+  // Adjust based on number of work areas: if many areas, each area gets fewer stories
+  const workAreaAdjustment = Math.max(1, analysis.workAreas.length / 2);
+
+  // Adjust based on sentence count: more sentences = more detailed = more stories
+  const sentenceBonus = Math.floor(analysis.sentenceCount / 2);
+
+  // Calculate raw story count
+  const rawStoryCount = Math.floor(baseStoryCount / workAreaAdjustment) + sentenceBonus;
+
+  // Apply fixed values as defined in manifest.yml prompt
+  // COMPLEX goals: 6 stories per epic
+  // MEDIUM goals: 3 stories per epic
+  // SIMPLE goals: 3 stories per epic
+  if (analysis.complexity === 'high') {
+    storyCount = 6;
+  } else if (analysis.complexity === 'medium') {
+    storyCount = 3;
+  } else {
+    storyCount = 3;
+  }
+
+  // Use all available phases up to the calculated count (or all if count exceeds available)
+  const storyPhases = availablePhases.slice(0, Math.min(storyCount, availablePhases.length));
 
   storyPhases.forEach(phase => {
     const story = {
@@ -301,7 +406,7 @@ function generateStoriesForWorkArea(type, goal, keywords, analysis) {
         'all requirements are met',
         'code is reviewed and tested'
       ),
-      subtasks: generateSubtasksForStory(phase, type, goal)
+      subtasks: generateSubtasksForStory(phase, type, goal, analysis)
     };
 
     // Add difficulty and estimated time
@@ -315,8 +420,8 @@ function generateStoriesForWorkArea(type, goal, keywords, analysis) {
       const subtaskEstimatedTime = calculateEstimatedTime(subtaskDifficulty, 'subtask', subtask.summary, subtask.description || '', 0);
       return {
         ...subtask,
-        difficulty: subtaskDifficulty, // Difficulty: Easy|Medium|Hard
-        estimatedTime: subtaskEstimatedTime // Estimated time: e.g., "2 hours"
+        difficulty: subtaskDifficulty,
+        estimatedTime: subtaskEstimatedTime
       };
     });
 
@@ -327,60 +432,104 @@ function generateStoriesForWorkArea(type, goal, keywords, analysis) {
 }
 
 /**
- * Get story phases based on work area type and count
+ * Get all available story phases for a work area type
+ * Returns full array - caller decides how many to use
  */
-function getStoryPhases(type, count) {
+function getStoryPhases(type) {
   const phases = {
     frontend: [
       { action: 'Design UI/UX', focus: 'wireframes and mockups' },
-      { action: 'Build components', focus: 'reusable UI elements' },
-      { action: 'Implement state management', focus: 'data flow and logic' },
-      { action: 'Add interactivity', focus: 'user interactions' }
+      { action: 'Build component library', focus: 'reusable UI elements' },
+      { action: 'Implement layouts', focus: 'page structure and routing' },
+      { action: 'Add state management', focus: 'data flow and logic' },
+      { action: 'Implement user interactions', focus: 'events and feedback' },
+      { action: 'Add responsive design', focus: 'mobile and tablet support' },
+      { action: 'Optimize performance', focus: 'loading and rendering' },
+      { action: 'Add accessibility features', focus: 'WCAG compliance' }
     ],
     backend: [
-      { action: 'Design API', focus: 'endpoints and data models' },
-      { action: 'Implement endpoints', focus: 'CRUD operations' },
+      { action: 'Design API architecture', focus: 'endpoints and data models' },
       { action: 'Set up database', focus: 'schema and migrations' },
-      { action: 'Add business logic', focus: 'processing and validation' }
+      { action: 'Implement core endpoints', focus: 'CRUD operations' },
+      { action: 'Add business logic', focus: 'processing and validation' },
+      { action: 'Implement error handling', focus: 'logging and monitoring' },
+      { action: 'Add API documentation', focus: 'OpenAPI/Swagger specs' },
+      { action: 'Implement caching', focus: 'performance optimization' },
+      { action: 'Add rate limiting', focus: 'security and throttling' }
     ],
     auth: [
-      { action: 'Design auth flow', focus: 'authentication strategy' },
-      { action: 'Implement login/signup', focus: 'user authentication' },
-      { action: 'Add authorization', focus: 'access control' }
+      { action: 'Design auth architecture', focus: 'authentication strategy' },
+      { action: 'Implement registration', focus: 'user signup flow' },
+      { action: 'Implement login', focus: 'authentication flow' },
+      { action: 'Add authorization', focus: 'role-based access control' },
+      { action: 'Implement session management', focus: 'tokens and refresh' },
+      { action: 'Add security features', focus: '2FA and password reset' },
+      { action: 'Add OAuth integration', focus: 'third-party auth' },
+      { action: 'Implement audit logging', focus: 'security tracking' }
     ],
     testing: [
       { action: 'Set up testing infrastructure', focus: 'testing framework' },
-      { action: 'Write tests', focus: 'unit and integration tests' },
-      { action: 'Perform QA', focus: 'manual testing and fixes' }
+      { action: 'Write unit tests', focus: 'component and function tests' },
+      { action: 'Write integration tests', focus: 'API and workflow tests' },
+      { action: 'Add end-to-end tests', focus: 'user journey testing' },
+      { action: 'Perform QA testing', focus: 'manual testing and fixes' },
+      { action: 'Set up test automation', focus: 'CI/CD integration' },
+      { action: 'Add performance tests', focus: 'load and stress testing' },
+      { action: 'Conduct security testing', focus: 'vulnerability assessment' }
     ],
     deployment: [
-      { action: 'Set up CI/CD', focus: 'automated pipeline' },
-      { action: 'Configure production', focus: 'environment setup' },
-      { action: 'Deploy to production', focus: 'release and verification' }
+      { action: 'Design deployment strategy', focus: 'environment planning' },
+      { action: 'Set up CI/CD pipeline', focus: 'automated builds and tests' },
+      { action: 'Configure staging environment', focus: 'pre-production setup' },
+      { action: 'Configure production environment', focus: 'production setup' },
+      { action: 'Implement monitoring', focus: 'logging and alerts' },
+      { action: 'Deploy to production', focus: 'release and verification' },
+      { action: 'Set up rollback procedures', focus: 'disaster recovery' },
+      { action: 'Configure auto-scaling', focus: 'performance and reliability' }
     ],
     data: [
-      { action: 'Design data structure', focus: 'schema and models' },
+      { action: 'Design data architecture', focus: 'schema and models' },
+      { action: 'Set up data pipeline', focus: 'ETL and processing' },
       { action: 'Implement data operations', focus: 'migration and sync' },
-      { action: 'Validate data', focus: 'testing and verification' }
+      { action: 'Add data validation', focus: 'quality and integrity' },
+      { action: 'Implement data backup', focus: 'recovery and retention' },
+      { action: 'Validate and test data', focus: 'testing and verification' },
+      { action: 'Add data governance', focus: 'compliance and policies' },
+      { action: 'Optimize data queries', focus: 'performance tuning' }
     ],
     mobile: [
       { action: 'Set up mobile project', focus: 'framework and structure' },
-      { action: 'Build mobile UI', focus: 'screens and navigation' },
-      { action: 'Add mobile features', focus: 'platform-specific functionality' }
+      { action: 'Design mobile UI', focus: 'screens and navigation' },
+      { action: 'Build core screens', focus: 'main user interfaces' },
+      { action: 'Add platform features', focus: 'iOS and Android specifics' },
+      { action: 'Implement offline support', focus: 'local storage and sync' },
+      { action: 'Test on devices', focus: 'device testing and optimization' },
+      { action: 'Add push notifications', focus: 'user engagement' },
+      { action: 'Optimize app performance', focus: 'battery and memory' }
     ],
     documentation: [
-      { action: 'Write technical docs', focus: 'API and architecture' },
-      { action: 'Create user guides', focus: 'end-user documentation' }
+      { action: 'Write architecture docs', focus: 'system design and overview' },
+      { action: 'Write API documentation', focus: 'endpoint reference' },
+      { action: 'Create user guides', focus: 'end-user documentation' },
+      { action: 'Write developer guides', focus: 'setup and contribution' },
+      { action: 'Add code examples', focus: 'tutorials and samples' },
+      { action: 'Create troubleshooting guide', focus: 'common issues and solutions' },
+      { action: 'Add release notes', focus: 'changelog and updates' },
+      { action: 'Document deployment process', focus: 'operations guide' }
     ],
     implementation: [
       { action: 'Analyze requirements', focus: 'gather and document needs' },
-      { action: 'Implement solution', focus: 'core functionality' },
-      { action: 'Test and refine', focus: 'quality assurance' }
+      { action: 'Design solution', focus: 'architecture and approach' },
+      { action: 'Implement core functionality', focus: 'main features' },
+      { action: 'Add supporting features', focus: 'auxiliary functionality' },
+      { action: 'Test and refine', focus: 'quality assurance' },
+      { action: 'Document and deploy', focus: 'finalization' },
+      { action: 'Gather feedback', focus: 'user acceptance' },
+      { action: 'Iterate and improve', focus: 'enhancements' }
     ]
   };
 
-  const areaPhases = phases[type] || phases.implementation;
-  return areaPhases.slice(0, count);
+  return phases[type] || phases.implementation;
 }
 
 /**
@@ -399,20 +548,53 @@ function generateStoryDescription(phase, type, goal) {
 
 /**
  * Generate subtasks for a story
+ * Dynamic with complexity-based ranges
  */
-function generateSubtasksForStory(phase, type, goal) {
-  // Generate 2-4 subtasks per story based on phase
-  const subtaskCount = Math.floor(Math.random() * 3) + 2; // 2-4 subtasks
-  const subtasks = [];
-
-  const genericSubtaskTemplates = [
+function generateSubtasksForStory(phase, type, goal, analysis) {
+  // Available subtask templates - represent typical phases of work
+  const subtaskTemplates = [
     { summary: `Research and plan ${phase.focus}` },
+    { summary: `Design ${phase.focus}` },
     { summary: `Implement ${phase.focus}` },
     { summary: `Test ${phase.focus}` },
-    { summary: `Document ${phase.focus}` }
+    { summary: `Document ${phase.focus}` },
+    { summary: `Review and refine ${phase.focus}` },
+    { summary: `Deploy ${phase.focus}` }
   ];
 
-  return genericSubtaskTemplates.slice(0, subtaskCount);
+  // Dynamically determine subtask count based on multiple factors
+  // More complex goals need more granular breakdown
+
+  // Factor 1: Base on word count - more detailed goals need more subtasks
+  const wordBasedCount = Math.ceil(analysis.wordCount / 12);
+
+  // Factor 2: Complexity multiplier
+  let complexityMultiplier = 1;
+  if (analysis.complexity === 'high') complexityMultiplier = 1.5;
+  if (analysis.complexity === 'medium') complexityMultiplier = 1.2;
+
+  // Factor 3: Work area type - some areas inherently need more detailed breakdown
+  const detailedAreas = ['backend', 'mobile', 'auth', 'data'];
+  const typeMultiplier = detailedAreas.includes(type) ? 1.3 : 1;
+
+  // Calculate raw subtask count
+  const rawSubtaskCount = Math.ceil(wordBasedCount * complexityMultiplier * typeMultiplier);
+
+  // Apply fixed values as defined in manifest.yml prompt
+  // COMPLEX goals: 5 subtasks per story
+  // MEDIUM goals: 3 subtasks per story
+  // SIMPLE goals: 3 subtasks per story
+  let subtaskCount;
+  if (analysis.complexity === 'high') {
+    subtaskCount = 5;
+  } else if (analysis.complexity === 'medium') {
+    subtaskCount = 3;
+  } else {
+    subtaskCount = 3;
+  }
+
+  // Return subtasks based on calculated count (up to available templates)
+  return subtaskTemplates.slice(0, Math.min(subtaskCount, subtaskTemplates.length));
 }
 
 /**
