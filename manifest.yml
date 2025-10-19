@@ -1,0 +1,78 @@
+modules:
+  rovo:agent:
+    - key: taskmanager-plan-generator
+      name: Jira Plan Generator
+      description: Automatically creates structured Jira plans (Epics, Stories, Subtasks) from messy goals
+      prompt: >
+        You are an intelligent Jira planning assistant that automatically creates structured project plans.
+
+        When a user describes a goal or project they want to build, you should:
+        1. Ask for their Jira project key if they haven't provided it (e.g., PROJ, TEST, DEV)
+        2. Use the create-jira-plan action to automatically generate and create epics, stories, and subtasks in Jira
+
+        The create-jira-plan action will analyze their goal and automatically create:
+        - Epics for different work areas (Frontend, Backend, Auth, Testing, etc.)
+        - Stories under each epic with acceptance criteria
+        - Subtasks under each story with actionable items
+
+        After creating the plan, tell the user:
+        - How many epics, stories, and subtasks were created
+        - That they can view them in their Jira project
+        - Key epics that were generated
+
+        Examples:
+        - User: "Build a payment system with Stripe"
+          You: "What's your Jira project key?"
+          User: "PROJ"
+          You: [Use create-jira-plan action] "Created 3 epics, 9 stories, and 27 subtasks for your payment system in project PROJ!"
+
+        - User: "Create a plan for a mobile app with user profiles in project TEST"
+          You: [Use create-jira-plan action] "Done! Created 4 epics, 12 stories, and 36 subtasks for your mobile app in TEST."
+      conversationStarters:
+        - Build me a user authentication system
+        - Create a plan for an e-commerce platform
+        - Generate tasks for a mobile app
+      actions:
+        - create-jira-plan
+  action:
+    - key: create-jira-plan
+      name: Create Jira Plan
+      function: createJiraPlanAction
+      actionVerb: CREATE
+      description: >
+        Automatically generates and creates a structured Jira plan (epics, stories, subtasks)
+        from a user's goal description. Analyzes the goal to detect work areas like frontend,
+        backend, authentication, testing, etc., and creates appropriate issues in Jira.
+      inputs:
+        projectKey:
+          title: Project Key
+          type: string
+          required: true
+          description: The Jira project key where issues will be created (e.g., PROJ, TEST, DEV)
+        goal:
+          title: Goal
+          type: string
+          required: true
+          description: The messy goal or project description from the user
+  webtrigger:
+    - key: rovo-plan-generator
+      function: planGenerator
+  function:
+    - key: planGenerator
+      handler: index.planGenerator
+    - key: createJiraPlanAction
+      handler: index.createJiraPlanAction
+permissions:
+  scopes:
+    - read:jira-work
+    - write:jira-work
+  external:
+    fetch:
+      backend:
+        - address: "*.atlassian.net"
+app:
+  runtime:
+    name: nodejs22.x
+    memoryMB: 256
+    architecture: arm64
+  id: ari:cloud:ecosystem::app/905bf6d2-236c-4c60-8879-cc65a0a4c5cf
